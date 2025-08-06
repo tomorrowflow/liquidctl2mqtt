@@ -57,14 +57,7 @@ def run_liquidctl_command():
         return None
     except json.JSONDecodeError as e:
         logger.error(f"Failed to parse liquidctl JSON output: {e}")
-        # Try to handle CSV output if JSON fails
-        try:
-            # If it's CSV, we could try parsing that way too
-            # For now, just return None for invalid JSON
-            return None
-        except Exception:
-            logger.error("Failed to process any liquidctl output format")
-            return None
+        return None
     except FileNotFoundError:
         logger.error("liquidctl command not found. Please ensure liquidctl is installed and in PATH.")
         return None
@@ -90,22 +83,19 @@ def get_device_name():
             capture_output=True,
             text=True,
             timeout=30,
-            check=False  # Don't raise exception on non-zero exit code
+            check=True
         )
+        data = json.loads(result.stdout)
         
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            
-            # Try to get device name from the first device in the output
-            if isinstance(data, list) and len(data) > 0:
-                device_info = data[0]
-                if 'device' in device_info:
-                    device_name = device_info['device'].replace(' ', '_').lower()
-                elif 'description' in device_info:
-                    device_name = device_info['description'].replace(' ', '_').lower()
-    except Exception as e:
+        # Try to get device name from the first device in the output
+        if isinstance(data, list) and len(data) > 0:
+            device_info = data[0]
+            if 'device' in device_info:
+                device_name = device_info['device'].replace(' ', '_').lower()
+            elif 'description' in device_info:
+                device_name = device_info['description'].replace(' ', '_').lower()
+    except Exception:
         # If we can't determine a better name, keep the default
-        logger.debug(f"Failed to extract device name from liquidctl output: {e}")
         pass
         
     return device_name
@@ -125,7 +115,7 @@ def publish_to_mqtt(data, device_name):
     mqtt_user = os.environ.get('MQTT_USER')
     mqtt_password = os.environ.get('MQTT_PASSWORD')
     
-    # Create MQTT client with proper initialization
+    # Create MQTT client
     client = mqtt.Client()
     
     # Set credentials if provided
