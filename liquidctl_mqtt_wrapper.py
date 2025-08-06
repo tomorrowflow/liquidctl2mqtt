@@ -115,8 +115,13 @@ def publish_to_mqtt(data, device_name):
     mqtt_user = os.environ.get('MQTT_USER')
     mqtt_password = os.environ.get('MQTT_PASSWORD')
     
-    # Create MQTT client
-    client = mqtt.Client()
+    # Create MQTT client with compatibility for different paho-mqtt versions
+    try:
+        # Try new API first (paho-mqtt >= 2.0)
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+    except (AttributeError, TypeError):
+        # Fall back to old API (paho-mqtt < 2.0)
+        client = mqtt.Client()
     
     # Set credentials if provided
     if mqtt_user and mqtt_password:
@@ -127,6 +132,9 @@ def publish_to_mqtt(data, device_name):
         logger.info(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}")
         client.connect(mqtt_host, mqtt_port, 60)
         
+        # Start the loop to handle network traffic
+        client.loop_start()
+        
         # Publish each sensor reading with appropriate topic structure
         timestamp = datetime.utcnow().isoformat() + 'Z'
         
@@ -136,7 +144,11 @@ def publish_to_mqtt(data, device_name):
         else:
             publish_device_sensors(client, data, device_name, timestamp)
             
-        # Disconnect
+        # Give time for messages to be sent
+        time.sleep(1)
+        
+        # Stop the loop and disconnect
+        client.loop_stop()
         client.disconnect()
         logger.info("Successfully published data to MQTT broker")
         
