@@ -73,8 +73,11 @@ def get_device_name():
     Returns:
         str: Device name for MQTT topics
     """
-    # Try to determine device name from environment or system
-    device_name = os.environ.get('LIQUIDCTL_DEVICE_NAME', 'liquid_cooling_system')
+    # Load configuration
+    config = load_config()
+    
+    # Try to determine device name from environment, config, or system
+    device_name = os.environ.get('LIQUIDCTL_DEVICE_NAME', config['liquidctl']['device_name'])
     
     # If we have data, try to extract more specific device info
     try:
@@ -83,22 +86,60 @@ def get_device_name():
             capture_output=True,
             text=True,
             timeout=30,
-            check=True
+            check=False  # Don't raise exception on non-zero exit code
         )
-        data = json.loads(result.stdout)
         
-        # Try to get device name from the first device in the output
-        if isinstance(data, list) and len(data) > 0:
-            device_info = data[0]
-            if 'device' in device_info:
-                device_name = device_info['device'].replace(' ', '_').lower()
-            elif 'description' in device_info:
-                device_name = device_info['description'].replace(' ', '_').lower()
-    except Exception:
+        if result.returncode == 0 and result.stdout.strip():
+            data = json.loads(result.stdout)
+            
+            # Try to get device name from the first device in the output
+            if isinstance(data, list) and len(data) > 0:
+                device_info = data[0]
+                if 'device' in device_info:
+                    device_name = device_info['device'].replace(' ', '_').lower()
+                elif 'description' in device_info:
+                    device_name = device_info['description'].replace(' ', '_').lower()
+    except Exception as e:
         # If we can't determine a better name, keep the default
+        logger.debug(f"Failed to extract device name from liquidctl output: {e}")
         pass
         
     return device_name
+
+
+def load_config():
+    """
+    Load configuration from config.json file or use defaults
+    
+    Returns:
+        dict: Configuration dictionary
+    """
+    config = {
+        'mqtt': {
+            'host': 'localhost',
+            'port': 1883,
+            'username': '',
+            'password': ''
+        },
+        'liquidctl': {
+            'device_name': 'liquid_cooling_system'
+        }
+    }
+    
+    try:
+        config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                file_config = json.load(f)
+                # Merge file config with defaults
+                config.update(file_config)
+                logger.info(f"Loaded configuration from {config_path}")
+        else:
+            logger.info("No config.json found, using defaults and environment variables")
+    except Exception as e:
+        logger.warning(f"Failed to load config.json: {e}, using defaults")
+    
+    return config
 
 
 def publish_to_mqtt(data, device_name):
@@ -109,19 +150,26 @@ def publish_to_mqtt(data, device_name):
         data (dict): Sensor data from liquidctl
         device_name (str): Name of the cooling device
     """
-    # MQTT Configuration
-    mqtt_host = os.environ.get('MQTT_HOST', 'localhost')
-    mqtt_port = int(os.environ.get('MQTT_PORT', 1883))
-    mqtt_user = os.environ.get('MQTT_USER')
-    mqtt_password = os.environ.get('MQTT_PASSWORD')
+    # Load configuration
+    config = load_config()
+    
+    # MQTT Configuration - prioritize environment variables over config file
+    mqtt_host = os.environ.get('MQTT_HOST', config['mqtt']['host'])
+    mqtt_port = int(os.environ.get('MQTT_PORT', config['mqtt']['port']))
+    mqtt_user = os.environ.get('MQTT_USER', config['mqtt']['username']) or None
+    mqtt_password = os.environ.get('MQTT_PASSWORD', config['mqtt']['password']) or None
     
     # Create MQTT client with compatibility for different paho-mqtt versions
     try:
-        # Try new API first (paho-mqtt >= 2.0)
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        # Try new API first (paho-mqtt >= 2.0) - use VERSION2 to avoid deprecation warning
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except (AttributeError, TypeError):
-        # Fall back to old API (paho-mqtt < 2.0)
-        client = mqtt.Client()
+        try:
+            # Try VERSION1 if VERSION2 is not available
+            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+        except (AttributeError, TypeError):
+            # Fall back to old API (paho-mqtt < 2.0)
+            client = mqtt.Client()
     
     # Set credentials if provided
     if mqtt_user and mqtt_password:
