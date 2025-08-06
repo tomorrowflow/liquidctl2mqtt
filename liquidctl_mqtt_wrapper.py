@@ -225,34 +225,104 @@ def publish_device_sensors(client, device_data, device_name, timestamp):
     else:
         device_id = device_name
         
-    # Handle different sensor types based on structure
-    for key, value in device_data.items():
-        if key == 'device' or key == 'description':
-            continue
-            
-        # If the value is a dictionary of sensors, publish each one
-        if isinstance(value, dict):
-            for sensor_type, sensor_values in value.items():
-                if isinstance(sensor_values, dict):
-                    # Handle nested sensor data like {'temperature': {'cpu_core': 37.5}, 'fan': {'pump_speed': 2400}}
-                    for sensor_name, sensor_value in sensor_values.items():
-                        publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp)
-                elif isinstance(sensor_values, list):
-                    # Handle array of sensors
-                    for i, item in enumerate(sensor_values):
-                        if isinstance(item, dict) and 'name' in item and 'value' in item:
-                            publish_single_sensor(client, device_name, sensor_type, item['name'], item['value'], timestamp)
-                else:
-                    # Handle direct sensor value
-                    publish_single_sensor(client, device_name, sensor_type, key, sensor_values, timestamp)
-        elif isinstance(value, list):
-            # Handle array of sensors at the top level
-            for i, item in enumerate(value):
-                if isinstance(item, dict) and 'name' in item and 'value' in item:
-                    publish_single_sensor(client, device_name, key, item['name'], item['value'], timestamp)
-        else:
-            # Handle direct sensor values
-            publish_single_sensor(client, device_name, 'general', key, value, timestamp)
+    # Handle liquidctl status format with 'status' array
+    if 'status' in device_data and isinstance(device_data['status'], list):
+        for sensor in device_data['status']:
+            if isinstance(sensor, dict) and 'key' in sensor and 'value' in sensor:
+                sensor_key = sensor['key']
+                sensor_value = sensor['value']
+                sensor_unit = sensor.get('unit', '')
+                
+                # Categorize sensors based on their key names
+                sensor_type = categorize_sensor(sensor_key)
+                
+                # Clean up sensor name for MQTT topic
+                sensor_name = sensor_key.lower().replace(' ', '_')
+                
+                # Create enhanced payload with unit information
+                payload = {
+                    "timestamp": timestamp,
+                    "sensor_type": sensor_type,
+                    "sensor_name": sensor_name,
+                    "value": sensor_value,
+                    "unit": sensor_unit,
+                    "original_key": sensor_key
+                }
+                
+                # Create topic with hierarchical structure
+                topic = f"liquidctl/{device_name}/{sensor_type}/{sensor_name}"
+                
+                try:
+                    logger.info(f"Publishing to {topic}: {sensor_value} {sensor_unit}")
+                    client.publish(topic, json.dumps(payload), qos=1)
+                except Exception as e:
+                    logger.error(f"Failed to publish sensor {sensor_name} to topic {topic}: {e}")
+    else:
+        # Handle other formats (fallback to original logic)
+        for key, value in device_data.items():
+            if key in ['device', 'description', 'bus', 'address']:
+                continue
+                
+            # If the value is a dictionary of sensors, publish each one
+            if isinstance(value, dict):
+                for sensor_type, sensor_values in value.items():
+                    if isinstance(sensor_values, dict):
+                        # Handle nested sensor data like {'temperature': {'cpu_core': 37.5}, 'fan': {'pump_speed': 2400}}
+                        for sensor_name, sensor_value in sensor_values.items():
+                            publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp)
+                    elif isinstance(sensor_values, list):
+                        # Handle array of sensors
+                        for i, item in enumerate(sensor_values):
+                            if isinstance(item, dict) and 'name' in item and 'value' in item:
+                                publish_single_sensor(client, device_name, sensor_type, item['name'], item['value'], timestamp)
+                    else:
+                        # Handle direct sensor value
+                        publish_single_sensor(client, device_name, sensor_type, key, sensor_values, timestamp)
+            elif isinstance(value, list):
+                # Handle array of sensors at the top level
+                for i, item in enumerate(value):
+                    if isinstance(item, dict) and 'name' in item and 'value' in item:
+                        publish_single_sensor(client, device_name, key, item['name'], item['value'], timestamp)
+            else:
+                # Handle direct sensor values (skip metadata)
+                if key not in ['bus', 'address', 'description']:
+                    publish_single_sensor(client, device_name, 'general', key, value, timestamp)
+
+
+def categorize_sensor(sensor_key):
+    """
+    Categorize sensor based on its key name
+    
+    Args:
+        sensor_key (str): The sensor key name
+        
+    Returns:
+        str: Category for the sensor
+    """
+    key_lower = sensor_key.lower()
+    
+    if 'temp' in key_lower or '°c' in key_lower:
+        return 'temperature'
+    elif 'fan' in key_lower and ('speed' in key_lower or 'rpm' in key_lower):
+        return 'fan_speed'
+    elif 'fan' in key_lower and 'power' in key_lower:
+        return 'fan_power'
+    elif 'fan' in key_lower and 'voltage' in key_lower:
+        return 'fan_voltage'
+    elif 'fan' in key_lower and 'current' in key_lower:
+        return 'fan_current'
+    elif 'flow' in key_lower:
+        return 'flow'
+    elif 'pump' in key_lower:
+        return 'pump'
+    elif 'voltage' in key_lower:
+        return 'voltage'
+    elif 'current' in key_lower:
+        return 'current'
+    elif 'power' in key_lower:
+        return 'power'
+    else:
+        return 'sensor'
 
 
 def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp):
