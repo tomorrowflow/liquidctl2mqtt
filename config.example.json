@@ -1,0 +1,11 @@
+{
+  "mqtt": {
+    "host": "localhost",
+    "port": 1883,
+    "username": "",
+    "password": ""
+  },
+  "liquidctl": {
+    "device_name": "my_cooling_system"
+  }
+}
