@@ -79,31 +79,6 @@ def get_device_name():
     # Try to determine device name from environment, config, or system
     device_name = os.environ.get('LIQUIDCTL_DEVICE_NAME', config['liquidctl']['device_name'])
     
-    # If we have data, try to extract more specific device info
-    try:
-        result = subprocess.run(
-            ['liquidctl', 'status', '--json'],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False  # Don't raise exception on non-zero exit code
-        )
-        
-        if result.returncode == 0 and result.stdout.strip():
-            data = json.loads(result.stdout)
-            
-            # Try to get device name from the first device in the output
-            if isinstance(data, list) and len(data) > 0:
-                device_info = data[0]
-                if 'device' in device_info:
-                    device_name = device_info['device'].replace(' ', '_').lower()
-                elif 'description' in device_info:
-                    device_name = device_info['description'].replace(' ', '_').lower()
-    except Exception as e:
-        # If we can't determine a better name, keep the default
-        logger.debug(f"Failed to extract device name from liquidctl output: {e}")
-        pass
-        
     return device_name
 
 
@@ -122,7 +97,8 @@ def load_config():
             'password': ''
         },
         'liquidctl': {
-            'device_name': 'liquid_cooling_system'
+            'device_name': 'liquid_cooling_system',
+            'units_enabled': False
         }
     }
     
@@ -159,6 +135,9 @@ def publish_to_mqtt(data, device_name):
     mqtt_user = os.environ.get('MQTT_USER', config['mqtt']['username']) or None
     mqtt_password = os.environ.get('MQTT_PASSWORD', config['mqtt']['password']) or None
     
+    # Units configuration - prioritize environment variable over config file
+    units_enabled = os.environ.get('LIQUIDCTL_UNITS_ENABLED', str(config['liquidctl']['units_enabled'])).lower() in ('true', '1', 'yes', 'on')
+    
     # Create MQTT client with compatibility for different paho-mqtt versions
     try:
         # Try new API first (paho-mqtt >= 2.0) - use VERSION2 to avoid deprecation warning
@@ -188,9 +167,9 @@ def publish_to_mqtt(data, device_name):
         
         if isinstance(data, list):
             for device_data in data:
-                publish_device_sensors(client, device_data, device_name, timestamp)
+                publish_device_sensors(client, device_data, device_name, timestamp, units_enabled)
         else:
-            publish_device_sensors(client, data, device_name, timestamp)
+            publish_device_sensors(client, data, device_name, timestamp, units_enabled)
             
         # Give time for messages to be sent
         time.sleep(1)
@@ -207,7 +186,7 @@ def publish_to_mqtt(data, device_name):
     return True
 
 
-def publish_device_sensors(client, device_data, device_name, timestamp):
+def publish_device_sensors(client, device_data, device_name, timestamp, units_enabled):
     """
     Publish all sensors from a single device
     
@@ -216,6 +195,7 @@ def publish_device_sensors(client, device_data, device_name, timestamp):
         device_data (dict): Data for one device
         device_name (str): Device name for topics
         timestamp (str): ISO timestamp for messages
+        units_enabled (bool): Whether to include units in the payload
     """
     # Extract device info if available
     if 'device' in device_data:
@@ -239,21 +219,25 @@ def publish_device_sensors(client, device_data, device_name, timestamp):
                 # Clean up sensor name for MQTT topic
                 sensor_name = sensor_key.lower().replace(' ', '_')
                 
-                # Create enhanced payload with unit information
+                # Create payload with conditional unit information
                 payload = {
                     "timestamp": timestamp,
                     "sensor_type": sensor_type,
                     "sensor_name": sensor_name,
                     "value": sensor_value,
-                    "unit": sensor_unit,
                     "original_key": sensor_key
                 }
+                
+                # Add unit field only if units are enabled
+                if units_enabled and sensor_unit:
+                    payload["unit"] = sensor_unit
                 
                 # Create topic with hierarchical structure
                 topic = f"liquidctl/{device_name}/{sensor_type}/{sensor_name}"
                 
                 try:
-                    logger.info(f"Publishing to {topic}: {sensor_value} {sensor_unit}")
+                    unit_display = f" {sensor_unit}" if units_enabled and sensor_unit else ""
+                    logger.info(f"Publishing to {topic}: {sensor_value}{unit_display}")
                     client.publish(topic, json.dumps(payload), qos=1)
                 except Exception as e:
                     logger.error(f"Failed to publish sensor {sensor_name} to topic {topic}: {e}")
@@ -269,24 +253,24 @@ def publish_device_sensors(client, device_data, device_name, timestamp):
                     if isinstance(sensor_values, dict):
                         # Handle nested sensor data like {'temperature': {'cpu_core': 37.5}, 'fan': {'pump_speed': 2400}}
                         for sensor_name, sensor_value in sensor_values.items():
-                            publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp)
+                            publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp, units_enabled)
                     elif isinstance(sensor_values, list):
                         # Handle array of sensors
                         for i, item in enumerate(sensor_values):
                             if isinstance(item, dict) and 'name' in item and 'value' in item:
-                                publish_single_sensor(client, device_name, sensor_type, item['name'], item['value'], timestamp)
+                                publish_single_sensor(client, device_name, sensor_type, item['name'], item['value'], timestamp, units_enabled)
                     else:
                         # Handle direct sensor value
-                        publish_single_sensor(client, device_name, sensor_type, key, sensor_values, timestamp)
+                        publish_single_sensor(client, device_name, sensor_type, key, sensor_values, timestamp, units_enabled)
             elif isinstance(value, list):
                 # Handle array of sensors at the top level
                 for i, item in enumerate(value):
                     if isinstance(item, dict) and 'name' in item and 'value' in item:
-                        publish_single_sensor(client, device_name, key, item['name'], item['value'], timestamp)
+                        publish_single_sensor(client, device_name, key, item['name'], item['value'], timestamp, units_enabled)
             else:
                 # Handle direct sensor values (skip metadata)
                 if key not in ['bus', 'address', 'description']:
-                    publish_single_sensor(client, device_name, 'general', key, value, timestamp)
+                    publish_single_sensor(client, device_name, 'general', key, value, timestamp, units_enabled)
 
 
 def categorize_sensor(sensor_key):
@@ -325,7 +309,7 @@ def categorize_sensor(sensor_key):
         return 'sensor'
 
 
-def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp):
+def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp, units_enabled):
     """
     Publish a single sensor reading to MQTT
     
@@ -336,6 +320,7 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
         sensor_name (str): Name of specific sensor
         sensor_value: Value of the sensor reading
         timestamp (str): ISO timestamp for messages
+        units_enabled (bool): Whether to include units in the payload
     """
     # Create topic with hierarchical structure
     topic = f"liquidctl/{device_name}/{sensor_type}/{sensor_name}"
@@ -347,6 +332,9 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
         "sensor_name": sensor_name,
         "value": sensor_value
     }
+    
+    # Note: This function doesn't have access to unit information from the original sensor data
+    # Units are primarily handled in publish_device_sensors for the main liquidctl status format
     
     try:
         logger.info(f"Publishing to {topic}: {sensor_value}")
