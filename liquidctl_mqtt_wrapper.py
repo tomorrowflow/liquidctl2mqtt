@@ -368,9 +368,22 @@ def main():
     """Main execution function"""
     logger.info("Starting liquidctl2mqtt wrapper")
 
+    # Load configuration
     config = load_config()
+    
+    # MQTT Configuration - prioritize environment variables over config file
+    mqtt_host = os.environ.get('MQTT_HOST', config['mqtt']['host'])
+    mqtt_port = int(os.environ.get('MQTT_PORT', config['mqtt']['port']))
+    mqtt_user = os.environ.get('MQTT_USER', config['mqtt']['username']) or None
+    mqtt_password = os.environ.get('MQTT_PASSWORD', config['mqtt']['password']) or None
     mqtt_topic_base = os.environ.get('MQTT_TOPIC_BASE', config['mqtt']['mqtt_topic_base'])
     nvidia_gpu_topic_base = os.environ.get('NVIDIA_GPU_TOPIC_BASE', config['mqtt']['nvidia_gpu_topic_base'])
+
+    # Units configuration - prioritize environment variable over config file
+    units_enabled = os.environ.get('LIQUIDCTL_UNITS_ENABLED', str(config['liquidctl']['units_enabled'])).lower() in ('true', '1', 'yes', 'on')
+
+    # Generate timestamp for all messages
+    timestamp = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     liquidctl_device_name = get_device_name()
     
@@ -404,27 +417,65 @@ def main():
     except Exception as e:
         logger.error(f"Unexpected error while getting GPU metrics: {e}. Returning empty list for GPU metrics.")
 
-    # DEBUG: Log function signature expectations
-    logger.info("DEBUG: publish_to_mqtt expects: (client, data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)")
-    
-    # Publish liquidctl data
-    if liquidctl_data:
-        logger.info("Publishing liquidctl data to MQTT")
-        logger.error("DEBUG: Missing MQTT client, timestamp, and units_enabled parameters in publish_to_mqtt call")
-        # publish_to_mqtt(liquidctl_data, liquidctl_device_name, mqtt_topic_base, nvidia_gpu_topic_base)
-    
-    # Publish GPU data
-    if gpu_data_list:
-        logger.info("Publishing NVIDIA GPU data to MQTT")
-        logger.error("DEBUG: Missing MQTT client, timestamp, and units_enabled parameters in publish_to_mqtt call")
-        # publish_to_mqtt(gpu_data_list, 'nvidia_gpu', mqtt_topic_base, nvidia_gpu_topic_base) # Pass 'nvidia_gpu' as device_name for GPU data
-
+    # Check if we have any data to publish
     if not liquidctl_data and not gpu_data_list:
         logger.error("No data (liquidctl or GPU) retrieved, exiting.")
         return 1
+
+    # Create MQTT client with compatibility for different paho-mqtt versions
+    client = None
+    try:
+        # Try new API first (paho-mqtt >= 2.0) - use VERSION2 to avoid deprecation warning
+        client = mqtt.Client(CallbackAPIVersion.VERSION2)
+    except (AttributeError, TypeError):
+        try:
+            # Try VERSION1 if VERSION2 is not available (paho-mqtt < 2.0)
+            client = mqtt.Client(CallbackAPIVersion.VERSION1)
+        except (AttributeError, TypeError):
+            # Fall back to old API (paho-mqtt < 2.0)
+            client = mqtt.Client()
     
-    logger.info("All relevant data successfully published to MQTT")
-    return 0
+    # Set credentials if provided
+    if mqtt_user and mqtt_password:
+        client.username_pw_set(mqtt_user, mqtt_password)
+    
+    try:
+        # Connect to MQTT broker
+        logger.info(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}")
+        client.connect(mqtt_host, mqtt_port, 60)
+        
+        # Start the loop to handle network traffic
+        client.loop_start()
+        
+        # Publish liquidctl data
+        if liquidctl_data:
+            logger.info("Publishing liquidctl data to MQTT")
+            publish_to_mqtt(client, liquidctl_data, liquidctl_device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+        
+        # Publish GPU data
+        if gpu_data_list:
+            logger.info("Publishing NVIDIA GPU data to MQTT")
+            publish_to_mqtt(client, gpu_data_list, 'nvidia_gpu', timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+
+        # Give time for messages to be sent before disconnecting
+        time.sleep(1)
+        
+        # Stop the loop and disconnect
+        client.loop_stop()
+        client.disconnect()
+        
+        logger.info("All relevant data successfully published to MQTT")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Failed to publish to MQTT: {e}")
+        if client:
+            try:
+                client.loop_stop()
+                client.disconnect()
+            except:
+                pass
+        return 1
 
 
 if __name__ == "__main__":
