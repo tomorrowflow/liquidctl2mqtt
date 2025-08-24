@@ -6,6 +6,7 @@
     "password": ""
   },
   "liquidctl": {
-    "device_name": "my_cooling_system"
+    "device_name": "my_cooling_system",
+    "units_enabled": false
   }
 }
