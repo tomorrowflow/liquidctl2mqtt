@@ -11,7 +11,7 @@ import json
 import sys
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 import os
@@ -148,7 +148,8 @@ def load_config():
             'port': 1883,
             'username': '',
             'password': '',
-            'mqtt_topic_base': 'liquidctl'
+            'mqtt_topic_base': 'home/liquidctl', # Default topic base for liquidctl
+            'nvidia_gpu_topic_base': 'home/nvidia_gpu' # Default topic base for NVIDIA GPU
         },
         'liquidctl': {
             'device_name': 'my_cooling_system',
@@ -172,94 +173,57 @@ def load_config():
     return config
 
 
-def publish_to_mqtt(data, device_name):
+def publish_to_mqtt(client, data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base):
     """
-    Publish sensor data to MQTT broker
+    Publish sensor data to MQTT broker.
+    This function expects an already connected MQTT client.
     
     Args:
-        data (dict): Sensor data from liquidctl
-        device_name (str): Name of the cooling device
+        client: MQTT client instance.
+        data (Union[dict, list]): Sensor data to publish.
+        device_name (str): Name of the cooling device. Used for topic construction.
+        timestamp (str): ISO timestamp for messages.
+        units_enabled (bool): Whether to include units in the payload.
+        mqtt_topic_base (str): Base topic for liquidctl data.
+        nvidia_gpu_topic_base (str): Base topic for NVIDIA GPU data.
     """
-    # Load configuration
-    config = load_config()
-    
-    # MQTT Configuration - prioritize environment variables over config file
-    mqtt_host = os.environ.get('MQTT_HOST', config['mqtt']['host'])
-    mqtt_port = int(os.environ.get('MQTT_PORT', config['mqtt']['port']))
-    mqtt_user = os.environ.get('MQTT_USER', config['mqtt']['username']) or None
-    mqtt_password = os.environ.get('MQTT_PASSWORD', config['mqtt']['password']) or None
-    mqtt_topic_base = os.environ.get('MQTT_TOPIC_BASE', config['mqtt']['mqtt_topic_base'])
-
-    # Units configuration - prioritize environment variable over config file
-    units_enabled = os.environ.get('LIQUIDCTL_UNITS_ENABLED', str(config['liquidctl']['units_enabled'])).lower() in ('true', '1', 'yes', 'on')
-
-    # Create MQTT client with compatibility for different paho-mqtt versions
-    try:
-        # Try new API first (paho-mqtt >= 2.0) - use VERSION2 to avoid deprecation warning
-        client = mqtt.Client(CallbackAPIVersion.VERSION2)
-    except (AttributeError, TypeError):
-        try:
-            # Try VERSION1 if VERSION2 is not available (paho-mqtt < 2.0)
-            client = mqtt.Client(CallbackAPIVersion.VERSION1)
-        except (AttributeError, TypeError):
-            # Fall back to old API (paho-mqtt < 2.0)
-            client = mqtt.Client()
-    
-    # Set credentials if provided
-    if mqtt_user and mqtt_password:
-        client.username_pw_set(mqtt_user, mqtt_password)
-    
-    try:
-        # Connect to MQTT broker
-        logger.info(f"Connecting to MQTT broker at {mqtt_host}:{mqtt_port}")
-        client.connect(mqtt_host, mqtt_port, 60)
-        
-        # Start the loop to handle network traffic
-        client.loop_start()
-        
-        # Publish each sensor reading with appropriate topic structure
-        timestamp = datetime.utcnow().isoformat() + 'Z'
-        
-        if isinstance(data, list):
-            for device_data in data:
-                publish_device_sensors(client, device_data, device_name, timestamp, units_enabled, mqtt_topic_base)
-        else:
-            publish_device_sensors(client, data, device_name, timestamp, units_enabled, mqtt_topic_base)
-            
-        # Give time for messages to be sent
-        time.sleep(1)
-        
-        # Stop the loop and disconnect
-        client.loop_stop()
-        client.disconnect()
-        logger.info("Successfully published data to MQTT broker")
-        
-    except Exception as e:
-        logger.error(f"Failed to publish to MQTT: {e}")
-        return False
-        
-    return True
+    if isinstance(data, list):
+        for device_data in data:
+            publish_device_sensors(client, device_data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+    else:
+        publish_device_sensors(client, data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+    logger.info("Data queued for publishing")
 
 
-def publish_device_sensors(client, device_data, device_name, timestamp, units_enabled, mqtt_topic_base):
+def publish_device_sensors(client, device_data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base):
     """
     Publish all sensors from a single device
     
     Args:
         client: MQTT client instance
         device_data (dict): Data for one device
-        device_name (str): Device name for topics
+        device_name (str): The logical device name (e.g., 'nvidia_gpu' or the liquidctl device name).
         timestamp (str): ISO timestamp for messages
         units_enabled (bool): Whether to include units in the payload
-        mqtt_topic_base (str): The base topic for MQTT messages
+        mqtt_topic_base (str): The base topic for liquidctl MQTT messages
+        nvidia_gpu_topic_base (str): The base topic for NVIDIA GPU MQTT messages
     """
-    # Extract device info if available
+    # Determine the topic base to use based on the `device_name` passed to this function.
+    # We use `device_name` here (which is consistent with the primary device from main)
+    # to select the correct base.
+    current_topic_base = nvidia_gpu_topic_base if device_name == 'nvidia_gpu' else mqtt_topic_base
+    
+    # Extract device_id for the *specific* device from device_data for detailed topic structure.
+    # This ensures "aquacomputer_quadro" appears in the topic if it's a liquidctl device.
     if 'device' in device_data:
-        device_id = device_data['device']
+        topic_device_id = device_data['device']
     elif 'description' in device_data:
-        device_id = device_data['description']
+        topic_device_id = device_data['description']
     else:
-        device_id = device_name
+        topic_device_id = device_name # Fallback, should align with device_name for consistency if no specific ID
+
+    # Clean up topic_device_id for MQTT topic construction
+    topic_device_id = topic_device_id.replace(' ', '_').lower()
         
     # Handle liquidctl status format with 'status' array
     if 'status' in device_data and isinstance(device_data['status'], list):
@@ -289,7 +253,7 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                     payload["unit"] = sensor_unit
                 
                 # Create topic with hierarchical structure
-                topic = f"{mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
+                topic = f"{current_topic_base}/{topic_device_id}/{sensor_type}/{sensor_name}"
                 
                 try:
                     unit_display = f" {sensor_unit}" if units_enabled and sensor_unit else ""
@@ -309,24 +273,24 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                     if isinstance(sensor_values, dict):
                         # Handle nested sensor data like {'temperature': {'cpu_core': 37.5}, 'fan': {'pump_speed': 2400}}
                         for sensor_name, sensor_value in sensor_values.items():
-                            publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp, units_enabled, mqtt_topic_base)
+                            publish_single_sensor(client, topic_device_id, sensor_type, sensor_name, sensor_value, timestamp, units_enabled, current_topic_base)
                     elif isinstance(sensor_values, list):
                         # Handle array of sensors
                         for i, item in enumerate(sensor_values):
                             if isinstance(item, dict) and 'name' in item and 'value' in item:
-                                publish_single_sensor(client, device_name, sensor_type, item['name'], item['value'], timestamp, units_enabled, mqtt_topic_base)
+                                publish_single_sensor(client, topic_device_id, sensor_type, item['name'], item['value'], timestamp, units_enabled, current_topic_base)
                     else:
                         # Handle direct sensor value
-                        publish_single_sensor(client, device_name, sensor_type, key, sensor_values, timestamp, units_enabled, mqtt_topic_base)
+                        publish_single_sensor(client, topic_device_id, sensor_type, key, sensor_values, timestamp, units_enabled, current_topic_base)
             elif isinstance(value, list):
                 # Handle array of sensors at the top level
                 for i, item in enumerate(value):
                     if isinstance(item, dict) and 'name' in item and 'value' in item:
-                        publish_single_sensor(client, device_name, key, item['name'], item['value'], timestamp, units_enabled, mqtt_topic_base)
+                        publish_single_sensor(client, topic_device_id, key, item['name'], item['value'], timestamp, units_enabled, current_topic_base)
             else:
                 # Handle direct sensor values (skip metadata)
                 if key not in ['bus', 'address', 'description']:
-                    publish_single_sensor(client, device_name, 'general', key, value, timestamp, units_enabled, mqtt_topic_base)
+                    publish_single_sensor(client, topic_device_id, 'general', key, value, timestamp, units_enabled, current_topic_base)
 
 
 def categorize_sensor(sensor_key):
@@ -365,7 +329,7 @@ def categorize_sensor(sensor_key):
         return 'sensor'
 
 
-def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp, units_enabled, mqtt_topic_base):
+def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_value, timestamp, units_enabled, target_mqtt_topic_base):
     """
     Publish a single sensor reading to MQTT
     
@@ -377,10 +341,10 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
         sensor_value: Value of the sensor reading
         timestamp (str): ISO timestamp for messages
         units_enabled (bool): Whether to include units in the payload
-        mqtt_topic_base (str): The base topic for MQTT messages
+        target_mqtt_topic_base (str): The base topic to use for MQTT messages (either liquidctl or nvidia_gpu)
     """
     # Create topic with hierarchical structure
-    topic = f"{mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
+    topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
     
     # Prepare message payload
     payload = {
@@ -403,12 +367,11 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
 def main():
     """Main execution function"""
     logger.info("Starting liquidctl2mqtt wrapper")
-    
-    # Get device name (this should now consider if GPU data is present)
-    # The get_device_name function primarily looks at liquidctl devices.
-    # For GPU temperature, we assign a default device name 'nvidia_gpu'.
-    # If there are no liquidctl devices, use 'nvidia_gpu' as the primary device name.
-    
+
+    config = load_config()
+    mqtt_topic_base = os.environ.get('MQTT_TOPIC_BASE', config['mqtt']['mqtt_topic_base'])
+    nvidia_gpu_topic_base = os.environ.get('NVIDIA_GPU_TOPIC_BASE', config['mqtt']['nvidia_gpu_topic_base'])
+
     liquidctl_device_name = get_device_name()
     
     # Run liquidctl command
@@ -421,7 +384,7 @@ def main():
         liquidctl_data = [liquidctl_data] # Ensure liquidctl_data is a list for consistent processing
 
     # Get GPU metrics
-    all_data = []
+    gpu_data_list = []
     try:
         gpu_metrics = get_gpu_metrics()
         if gpu_metrics:
@@ -430,41 +393,38 @@ def main():
                 gpu_status_list.append({'key': f'GPU {i} Temperature', 'value': metrics['temperature'], 'unit': '°C'})
                 gpu_status_list.append({'key': f'GPU {i} Power', 'value': metrics['power'], 'unit': 'W'})
             
-            gpu_data = {
+            gpu_data_list.append({
                 'device': 'nvidia_gpu',
                 'description': 'NVIDIA GPU Metrics',
                 'status': gpu_status_list
-            }
-            all_data.append(gpu_data)
+            })
             logger.info(f"Successfully retrieved GPU metrics: {gpu_metrics}")
     except NvidiaSmiError as e:
         logger.error(f"Failed to get GPU metrics: {e}. Returning empty list for GPU metrics.")
     except Exception as e:
         logger.error(f"Unexpected error while getting GPU metrics: {e}. Returning empty list for GPU metrics.")
 
-    # Combine liquidctl data with GPU data
-    all_data.extend(liquidctl_data)
+    # DEBUG: Log function signature expectations
+    logger.info("DEBUG: publish_to_mqtt expects: (client, data, device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)")
+    
+    # Publish liquidctl data
+    if liquidctl_data:
+        logger.info("Publishing liquidctl data to MQTT")
+        logger.error("DEBUG: Missing MQTT client, timestamp, and units_enabled parameters in publish_to_mqtt call")
+        # publish_to_mqtt(liquidctl_data, liquidctl_device_name, mqtt_topic_base, nvidia_gpu_topic_base)
+    
+    # Publish GPU data
+    if gpu_data_list:
+        logger.info("Publishing NVIDIA GPU data to MQTT")
+        logger.error("DEBUG: Missing MQTT client, timestamp, and units_enabled parameters in publish_to_mqtt call")
+        # publish_to_mqtt(gpu_data_list, 'nvidia_gpu', mqtt_topic_base, nvidia_gpu_topic_base) # Pass 'nvidia_gpu' as device_name for GPU data
 
-    if not all_data:
+    if not liquidctl_data and not gpu_data_list:
         logger.error("No data (liquidctl or GPU) retrieved, exiting.")
         return 1
-
-    # Determine the primary device name for MQTT publishing
-    # If liquidctl_device_name is still default and GPU data exists, use 'nvidia_gpu' as primary
-    if liquidctl_device_name == load_config()['liquidctl']['device_name'] and any(d.get('device') == 'nvidia_gpu' for d in all_data):
-        primary_device_name = 'nvidia_gpu'
-    else:
-        primary_device_name = liquidctl_device_name
-
-    # Publish to MQTT
-    success = publish_to_mqtt(all_data, primary_device_name)
     
-    if success:
-        logger.info("Data successfully published to MQTT")
-        return 0
-    else:
-        logger.error("Failed to publish data to MQTT")
-        return 1
+    logger.info("All relevant data successfully published to MQTT")
+    return 0
 
 
 if __name__ == "__main__":

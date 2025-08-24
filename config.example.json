@@ -4,7 +4,8 @@
     "port": 1883,
     "username": "",
     "password": "",
-    "mqtt_topic_base": "liquidctl"
+    "mqtt_topic_base": "home/liquidctl",
+    "nvidia_gpu_topic_base": "home/nvidia_gpu"
   },
   "liquidctl": {
     "device_name": "my_cooling_system",
