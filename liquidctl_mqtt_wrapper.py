@@ -74,16 +74,16 @@ def run_liquidctl_command():
 
 def get_gpu_metrics():
     """
-    Executes nvidia-smi command, parses output for GPU temperatures and power, and returns them.
+    Executes nvidia-smi command, parses output for GPU name, temperatures, and power, and returns them.
 
     Returns:
-        list: A list of dictionaries, each containing 'temperature' (int) and 'power' (float) for a GPU.
+        list: A list of dictionaries, each containing 'name' (str), 'temperature' (int) and 'power' (float) for a GPU.
 
     Raises:
         NvidiaSmiError: If nvidia-smi command fails or returns unexpected output.
     """
     try:
-        command = ['nvidia-smi', '--query-gpu=temperature.gpu,power.draw', '--format=csv,noheader,nounits']
+        command = ['nvidia-smi', '--query-gpu=name,temperature.gpu,power.draw', '--format=csv,noheader,nounits']
         result = subprocess.run(
             command,
             capture_output=True,
@@ -97,13 +97,17 @@ def get_gpu_metrics():
             line = line.strip()
             if line:
                 try:
-                    # Example: "45, 120.50" (temperature, power)
-                    temp_str, power_str = line.split(',')
-                    temperature = int(temp_str.strip())
-                    power = float(power_str.strip())
-                    gpu_metrics.append({'temperature': temperature, 'power': power})
-                except ValueError:
-                    logger.warning(f"Could not parse GPU metrics from line: '{line}'")
+                    # Example: "NVIDIA GeForce RTX 3090, 45, 120.50" (name, temperature, power)
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) == 3:
+                        name, temp_str, power_str = parts
+                        temperature = int(temp_str)
+                        power = float(power_str)
+                        gpu_metrics.append({'name': name, 'temperature': temperature, 'power': power})
+                    else:
+                        logger.warning(f"Could not parse GPU metrics from line (expected 3 parts): '{line}'")
+                except ValueError as ve:
+                    logger.warning(f"Could not parse GPU metrics from line '{line}': {ve}")
         return gpu_metrics
     except FileNotFoundError:
         logger.warning("Command 'nvidia-smi' not found. Assuming no NVIDIA GPUs or drivers.")
@@ -403,11 +407,16 @@ def main():
         if gpu_metrics:
             gpu_status_list = []
             for i, metrics in enumerate(gpu_metrics):
-                gpu_status_list.append({'key': f'GPU {i} Temperature', 'value': metrics['temperature'], 'unit': '°C'})
-                gpu_status_list.append({'key': f'GPU {i} Power', 'value': metrics['power'], 'unit': 'W'})
+                gpu_name = metrics.get('name', f'gpu_{i}').replace(' ', '_').lower()
+                gpu_status_list.append({'key': f'{gpu_name}_temperature', 'value': metrics['temperature'], 'unit': '°C'})
+                gpu_status_list.append({'key': f'{gpu_name}_power', 'value': metrics['power'], 'unit': 'W'})
+            
+            # The 'device' identifies the specific GPU instance or name.
+            # We take the name of the first GPU as the primary device identifier for the list.
+            primary_gpu_name = gpu_metrics[0]['name'].replace(' ', '_').lower() if gpu_metrics else 'nvidia_gpu'
             
             gpu_data_list.append({
-                'device': 'nvidia_gpu',
+                'device': primary_gpu_name,
                 'description': 'NVIDIA GPU Metrics',
                 'status': gpu_status_list
             })
@@ -455,7 +464,10 @@ def main():
         # Publish GPU data
         if gpu_data_list:
             logger.info("Publishing NVIDIA GPU data to MQTT")
-            publish_to_mqtt(client, gpu_data_list, 'nvidia_gpu', timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+            # Extract the actual GPU device name from the first entry in gpu_data_list
+            # This name is used to construct the MQTT topic, replacing the static 'nvidia_gpu'
+            actual_gpu_device_name = gpu_data_list[0].get('device', 'nvidia_gpu')
+            publish_to_mqtt(client, gpu_data_list, actual_gpu_device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
 
         # Give time for messages to be sent before disconnecting
         time.sleep(1)
