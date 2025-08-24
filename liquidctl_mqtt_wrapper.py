@@ -405,21 +405,19 @@ def main():
     try:
         gpu_metrics = get_gpu_metrics()
         if gpu_metrics:
-            gpu_status_list = []
             for i, metrics in enumerate(gpu_metrics):
-                gpu_name = metrics.get('name', f'gpu_{i}').replace(' ', '_').lower()
-                gpu_status_list.append({'key': f'{gpu_name}_temperature', 'value': metrics['temperature'], 'unit': '°C'})
-                gpu_status_list.append({'key': f'{gpu_name}_power', 'value': metrics['power'], 'unit': 'W'})
-            
-            # The 'device' identifies the specific GPU instance or name.
-            # We take the name of the first GPU as the primary device identifier for the list.
-            primary_gpu_name = gpu_metrics[0]['name'].replace(' ', '_').lower() if gpu_metrics else 'nvidia_gpu'
-            
-            gpu_data_list.append({
-                'device': primary_gpu_name,
-                'description': 'NVIDIA GPU Metrics',
-                'status': gpu_status_list
-            })
+                gpu_name_base = metrics.get('name', 'nvidia_gpu').replace(' ', '_').lower()
+                unique_gpu_device_id = f"{gpu_name_base}_gpu_{i}"
+                
+                gpu_status_list = []
+                gpu_status_list.append({'key': 'temperature', 'value': metrics['temperature'], 'unit': '°C'})
+                gpu_status_list.append({'key': 'power', 'value': metrics['power'], 'unit': 'W'})
+                
+                gpu_data_list.append({
+                    'device': unique_gpu_device_id,
+                    'description': f'NVIDIA GPU {i} Metrics',
+                    'status': gpu_status_list
+                })
             logger.info(f"Successfully retrieved GPU metrics: {gpu_metrics}")
     except NvidiaSmiError as e:
         logger.error(f"Failed to get GPU metrics: {e}. Returning empty list for GPU metrics.")
@@ -464,10 +462,14 @@ def main():
         # Publish GPU data
         if gpu_data_list:
             logger.info("Publishing NVIDIA GPU data to MQTT")
-            # Extract the actual GPU device name from the first entry in gpu_data_list
-            # This name is used to construct the MQTT topic, replacing the static 'nvidia_gpu'
-            actual_gpu_device_name = gpu_data_list[0].get('device', 'nvidia_gpu')
-            publish_to_mqtt(client, gpu_data_list, actual_gpu_device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
+            # Since gpu_data_list now contains one entry per GPU, with its unique device ID,
+            # we iterate through it and publish each GPU's data individually.
+            # The 'device_name' argument to publish_to_mqtt is expected to be a single string for the primary device.
+            # For GPU data, each entry in gpu_data_list itself represents a distinct 'device' for topic construction,
+            # so we'll pass the 'device' from each list item directly.
+            for gpu_device_data in gpu_data_list:
+                actual_gpu_device_name = gpu_device_data.get('device', 'nvidia_gpu')
+                publish_to_mqtt(client, gpu_device_data, actual_gpu_device_name, timestamp, units_enabled, mqtt_topic_base, nvidia_gpu_topic_base)
 
         # Give time for messages to be sent before disconnecting
         time.sleep(1)
