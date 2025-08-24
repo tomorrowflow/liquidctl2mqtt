@@ -13,6 +13,7 @@ import logging
 import time
 from datetime import datetime
 import paho.mqtt.client as mqtt
+from paho.mqtt.enums import CallbackAPIVersion
 import os
 
 
@@ -26,6 +27,11 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+class NvidiaSmiError(Exception):
+    """Custom exception for nvidia-smi command errors."""
+    pass
 
 
 def run_liquidctl_command():
@@ -64,6 +70,53 @@ def run_liquidctl_command():
     except Exception as e:
         logger.error(f"Unexpected error running liquidctl: {e}")
         return None
+
+
+def get_gpu_metrics():
+    """
+    Executes nvidia-smi command, parses output for GPU temperatures and power, and returns them.
+
+    Returns:
+        list: A list of dictionaries, each containing 'temperature' (int) and 'power' (float) for a GPU.
+
+    Raises:
+        NvidiaSmiError: If nvidia-smi command fails or returns unexpected output.
+    """
+    try:
+        command = ['nvidia-smi', '--query-gpu=temperature.gpu,power.draw', '--format=csv,noheader,nounits']
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True
+        )
+
+        gpu_metrics = []
+        for line in result.stdout.strip().split('\n'):
+            line = line.strip()
+            if line:
+                try:
+                    # Example: "45, 120.50" (temperature, power)
+                    temp_str, power_str = line.split(',')
+                    temperature = int(temp_str.strip())
+                    power = float(power_str.strip())
+                    gpu_metrics.append({'temperature': temperature, 'power': power})
+                except ValueError:
+                    logger.warning(f"Could not parse GPU metrics from line: '{line}'")
+        return gpu_metrics
+    except FileNotFoundError:
+        logger.warning("Command 'nvidia-smi' not found. Assuming no NVIDIA GPUs or drivers.")
+        return []
+    except subprocess.CalledProcessError as e:
+        raise NvidiaSmiError(
+            f"nvidia-smi command failed with exit code {e.returncode}. "
+            f"Error: {e.stderr.strip()}"
+        ) from e
+    except subprocess.TimeoutExpired:
+        raise NvidiaSmiError("nvidia-smi command timed out.")
+    except Exception as e:
+        raise NvidiaSmiError(f"An unexpected error occurred while getting GPU metrics: {e}") from e
 
 
 def get_device_name():
@@ -162,11 +215,11 @@ def publish_to_mqtt(data, device_name):
     # Create MQTT client with compatibility for different paho-mqtt versions
     try:
         # Try new API first (paho-mqtt >= 2.0) - use VERSION2 to avoid deprecation warning
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client = mqtt.Client(CallbackAPIVersion.VERSION2)
     except (AttributeError, TypeError):
         try:
             # Try VERSION1 if VERSION2 is not available
-            client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+            client = mqtt.Client(CallbackAPIVersion.VERSION1)
         except (AttributeError, TypeError):
             # Fall back to old API (paho-mqtt < 2.0)
             client = mqtt.Client()
@@ -359,18 +412,60 @@ def main():
     """Main execution function"""
     logger.info("Starting liquidctl2mqtt wrapper")
     
-    # Get device name
-    device_name = get_device_name()
+    # Get device name (this should now consider if GPU data is present)
+    # The get_device_name function primarily looks at liquidctl devices.
+    # For GPU temperature, we assign a default device name 'nvidia_gpu'.
+    # If there are no liquidctl devices, use 'nvidia_gpu' as the primary device name.
+    
+    liquidctl_device_name = get_device_name()
     
     # Run liquidctl command
-    data = run_liquidctl_command()
+    liquidctl_data = run_liquidctl_command()
     
-    if data is None:
-        logger.error("No data retrieved from liquidctl, exiting")
+    if liquidctl_data is None:
+        logger.info("No data retrieved from liquidctl.")
+        liquidctl_data = [] # Ensure it's an empty list if no liquidctl data
+    elif not isinstance(liquidctl_data, list):
+        liquidctl_data = [liquidctl_data] # Ensure liquidctl_data is a list for consistent processing
+
+    # Get GPU metrics
+    all_data = []
+    try:
+        gpu_metrics = get_gpu_metrics()
+        if gpu_metrics:
+            gpu_status_list = []
+            for i, metrics in enumerate(gpu_metrics):
+                gpu_status_list.append({'key': f'GPU {i} Temperature', 'value': metrics['temperature'], 'unit': '°C'})
+                gpu_status_list.append({'key': f'GPU {i} Power', 'value': metrics['power'], 'unit': 'W'})
+            
+            gpu_data = {
+                'device': 'nvidia_gpu',
+                'description': 'NVIDIA GPU Metrics',
+                'status': gpu_status_list
+            }
+            all_data.append(gpu_data)
+            logger.info(f"Successfully retrieved GPU metrics: {gpu_metrics}")
+    except NvidiaSmiError as e:
+        logger.error(f"Failed to get GPU metrics: {e}. Returning empty list for GPU metrics.")
+    except Exception as e:
+        logger.error(f"Unexpected error while getting GPU metrics: {e}. Returning empty list for GPU metrics.")
+
+    # Combine liquidctl data with GPU data
+    all_data.extend(liquidctl_data)
+
+    if not all_data:
+        logger.error("No data (liquidctl or GPU) retrieved, exiting.")
         return 1
-    
+
+    # Determine the primary device name for MQTT publishing
+    # If liquidctl_device_name is still default and GPU data exists, use 'nvidia_gpu' as primary
+    if liquidctl_device_name == load_config()['liquidctl']['device_name'] and any(d.get('device') == 'nvidia_gpu' for d in all_data):
+        primary_device_name = 'nvidia_gpu'
+    else:
+        primary_device_name = liquidctl_device_name
+
     # Publish to MQTT
-    success = publish_to_mqtt(data, device_name)
+    success = publish_to_mqtt(all_data, primary_device_name)
     
     if success:
         logger.info("Data successfully published to MQTT")
