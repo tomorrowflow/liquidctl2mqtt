@@ -3,7 +3,8 @@
     "host": "localhost",
     "port": 1883,
     "username": "",
-    "password": ""
+    "password": "",
+    "mqtt_topic_base": "liquidctl"
   },
   "liquidctl": {
     "device_name": "my_cooling_system",
