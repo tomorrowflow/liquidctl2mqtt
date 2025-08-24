@@ -266,35 +266,25 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                 except Exception as e:
                     logger.error(f"Failed to publish sensor {sensor_name} to topic {topic}: {e}")
     else:
-        # Handle other formats (fallback to original logic)
-        for key, value in device_data.items():
-            if key in ['device', 'description', 'bus', 'address']:
-                continue
-                
-            # If the value is a dictionary of sensors, publish each one
-            if isinstance(value, dict):
-                for sensor_type, sensor_values in value.items():
-                    if isinstance(sensor_values, dict):
-                        # Handle nested sensor data like {'temperature': {'cpu_core': 37.5}, 'fan': {'pump_speed': 2400}}
-                        for sensor_name, sensor_value in sensor_values.items():
-                            publish_single_sensor(client, topic_device_id, sensor_type, sensor_name, sensor_value, timestamp, units_enabled, current_topic_base)
-                    elif isinstance(sensor_values, list):
-                        # Handle array of sensors
-                        for i, item in enumerate(sensor_values):
-                            if isinstance(item, dict) and 'name' in item and 'value' in item:
-                                publish_single_sensor(client, topic_device_id, sensor_type, item['name'], item['value'], timestamp, units_enabled, current_topic_base)
-                    else:
-                        # Handle direct sensor value
-                        publish_single_sensor(client, topic_device_id, sensor_type, key, sensor_values, timestamp, units_enabled, current_topic_base)
-            elif isinstance(value, list):
-                # Handle array of sensors at the top level
-                for i, item in enumerate(value):
-                    if isinstance(item, dict) and 'name' in item and 'value' in item:
-                        publish_single_sensor(client, topic_device_id, key, item['name'], item['value'], timestamp, units_enabled, current_topic_base)
-            else:
-                # Handle direct sensor values (skip metadata)
-                if key not in ['bus', 'address', 'description']:
-                    publish_single_sensor(client, topic_device_id, 'general', key, value, timestamp, units_enabled, current_topic_base)
+        # This branch handles the GPU data, as it does not have a 'status' array field.
+        # device_data in this case should be a single dictionary for one GPU,
+        # formatted like: {'device': 'nvidia_geforce_rtx_3090_gpu_0', 'description': 'NVIDIA GPU 0 Metrics', 'status': [{'key': 'temperature', 'value': 27, 'unit': '°C'}, {'key': 'power', 'value': 21.97, 'unit': 'W'}]}
+        # The `device_data` here is actually the `gpu_device_data` passed from `main`'s loop.
+
+        # Ensure we are processing the correct structure for GPU data
+        if 'status' in device_data and isinstance(device_data['status'], list):
+            for sensor in device_data['status']:
+                if isinstance(sensor, dict) and 'key' in sensor and 'value' in sensor:
+                    sensor_key = sensor['key'] # 'temperature', 'power'
+                    sensor_value = sensor['value']
+                    sensor_unit = sensor.get('unit', '') # '°C', 'W'
+                    
+                    # For GPU metrics, sensor_type will be 'temperature' or 'power'
+                    # The sensor_name for the topic will also be 'temperature' or 'power'
+                    # The `publish_single_sensor` function will handle the de-duplication in the topic path.
+                    publish_single_sensor(client, topic_device_id, sensor_key, sensor_key, sensor_value, timestamp, units_enabled, current_topic_base)
+        else:
+            logger.warning(f"Unexpected GPU data format, cannot publish: {device_data}")
 
 
 def categorize_sensor(sensor_key):
@@ -347,14 +337,23 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
         units_enabled (bool): Whether to include units in the payload
         target_mqtt_topic_base (str): The base topic to use for MQTT messages (either liquidctl or nvidia_gpu)
     """
+    # For GPU metrics, sensor_type is already the category (e.g., 'temperature', 'power').
+    # We want the topic to be: home/nvidia_gpu/{gpu_name_gpu_X}/{sensor_type}
+    # So, effectively, sensor_name should be omitted from the topic if it's identical to sensor_type.
+    # We'll use the device_name derived from the GPU for the topic_device_id and sensor_type directly.
+    
     # Create topic with hierarchical structure
-    topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
+    # Check if sensor_name is the same as sensor_type, if so, omit it from the topic path
+    if sensor_name == sensor_type:
+        topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}"
+    else:
+        topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
     
     # Prepare message payload
     payload = {
         "timestamp": timestamp,
         "sensor_type": sensor_type,
-        "sensor_name": sensor_name,
+        "sensor_name": sensor_name, # Keep sensor_name in payload for detail, even if omitted from topic path
         "value": sensor_value
     }
     
