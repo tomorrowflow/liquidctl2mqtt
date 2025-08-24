@@ -213,23 +213,22 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
         nvidia_gpu_topic_base (str): The base topic for NVIDIA GPU MQTT messages
     """
     # Determine the topic base to use based on the `device_name` passed to this function.
-    # We use `device_name` here (which is consistent with the primary device from main)
-    # to select the correct base.
-    current_topic_base = nvidia_gpu_topic_base if device_name == 'nvidia_gpu' else mqtt_topic_base
+    # `device_name` here will be either the liquidctl device name or a specific GPU device_id (e.g., 'nvidia_geforce_rtx_3090_gpu_0').
+    # We check if the device_name matches the pattern for GPU devices to use the correct topic base.
+    is_gpu_device = device_name.startswith('nvidia_') and '_gpu_' in device_name
+    current_topic_base = nvidia_gpu_topic_base if is_gpu_device else mqtt_topic_base
     
-    # Extract device_id for the *specific* device from device_data for detailed topic structure.
-    # This ensures "aquacomputer_quadro" appears in the topic if it's a liquidctl device.
-    if 'device' in device_data:
-        topic_device_id = device_data['device']
+    # Extract topic_device_id. If it's a GPU device, use the device_name directly as it's already unique.
+    if is_gpu_device:
+        topic_device_id = device_name
+    elif 'device' in device_data:
+        topic_device_id = device_data['device'].replace(' ', '_').lower()
     elif 'description' in device_data:
-        topic_device_id = device_data['description']
+        topic_device_id = device_data['description'].replace(' ', '_').lower()
     else:
-        topic_device_id = device_name # Fallback, should align with device_name for consistency if no specific ID
+        topic_device_id = device_name.replace(' ', '_').lower() # Fallback
 
-    # Clean up topic_device_id for MQTT topic construction
-    topic_device_id = topic_device_id.replace(' ', '_').lower()
-        
-    # Handle liquidctl status format with 'status' array
+    # Handle liquidctl status format with 'status' array or GPU data
     if 'status' in device_data and isinstance(device_data['status'], list):
         for sensor in device_data['status']:
             if isinstance(sensor, dict) and 'key' in sensor and 'value' in sensor:
@@ -237,19 +236,22 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                 sensor_value = sensor['value']
                 sensor_unit = sensor.get('unit', '')
                 
-                # Categorize sensors based on their key names
-                sensor_type = categorize_sensor(sensor_key)
-                
-                # Clean up sensor name for MQTT topic
-                sensor_name = sensor_key.lower().replace(' ', '_')
-                
+                # For liquidctl data, categorize sensor key to get type, then clean name
+                if not is_gpu_device:
+                    sensor_type = categorize_sensor(sensor_key)
+                    sensor_name = sensor_key.lower().replace(' ', '_')
+                else: # For GPU data, key is already sensor_type/name (e.g., 'temperature', 'power')
+                    sensor_type = sensor_key.lower()
+                    sensor_name = sensor_key.lower()
+
+
                 # Create payload with conditional unit information
                 payload = {
                     "timestamp": timestamp,
                     "sensor_type": sensor_type,
                     "sensor_name": sensor_name,
                     "value": sensor_value,
-                    "original_key": sensor_key
+                    "original_key": sensor_key # Keep original key for debugging/reference
                 }
                 
                 # Add unit field only if units are enabled
@@ -257,7 +259,12 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                     payload["unit"] = sensor_unit
                 
                 # Create topic with hierarchical structure
-                topic = f"{current_topic_base}/{topic_device_id}/{sensor_type}/{sensor_name}"
+                # For GPU, this will now be: home/nvidia_gpu/{gpu_device_id}/{sensor_type}
+                # For liquidctl, it remains: home/liquidctl/{aquacomputer_quadro}/{sensor_type}/{sensor_name}
+                if is_gpu_device:
+                    topic = f"{current_topic_base}/{topic_device_id}/{sensor_type}"
+                else:
+                    topic = f"{current_topic_base}/{topic_device_id}/{sensor_type}/{sensor_name}"
                 
                 try:
                     unit_display = f" {sensor_unit}" if units_enabled and sensor_unit else ""
@@ -266,25 +273,13 @@ def publish_device_sensors(client, device_data, device_name, timestamp, units_en
                 except Exception as e:
                     logger.error(f"Failed to publish sensor {sensor_name} to topic {topic}: {e}")
     else:
-        # This branch handles the GPU data, as it does not have a 'status' array field.
-        # device_data in this case should be a single dictionary for one GPU,
-        # formatted like: {'device': 'nvidia_geforce_rtx_3090_gpu_0', 'description': 'NVIDIA GPU 0 Metrics', 'status': [{'key': 'temperature', 'value': 27, 'unit': '°C'}, {'key': 'power', 'value': 21.97, 'unit': 'W'}]}
-        # The `device_data` here is actually the `gpu_device_data` passed from `main`'s loop.
 
-        # Ensure we are processing the correct structure for GPU data
-        if 'status' in device_data and isinstance(device_data['status'], list):
-            for sensor in device_data['status']:
-                if isinstance(sensor, dict) and 'key' in sensor and 'value' in sensor:
-                    sensor_key = sensor['key'] # 'temperature', 'power'
-                    sensor_value = sensor['value']
-                    sensor_unit = sensor.get('unit', '') # '°C', 'W'
-                    
-                    # For GPU metrics, sensor_type will be 'temperature' or 'power'
-                    # The sensor_name for the topic will also be 'temperature' or 'power'
-                    # The `publish_single_sensor` function will handle the de-duplication in the topic path.
-                    publish_single_sensor(client, topic_device_id, sensor_key, sensor_key, sensor_value, timestamp, units_enabled, current_topic_base)
-        else:
-            logger.warning(f"Unexpected GPU data format, cannot publish: {device_data}")
+        # Fallback for unexpected data structure or direct sensor values, not typically used for current GPU data format.
+        logger.warning(f"Unexpected data format in publish_device_sensors (no 'status' list): {device_data}. Attempting generic publish.")
+        for key, value in device_data.items():
+            if key in ['device', 'description', 'bus', 'address']:
+                continue
+            publish_single_sensor(client, topic_device_id, 'general', key, value, timestamp, units_enabled, current_topic_base)
 
 
 def categorize_sensor(sensor_key):
@@ -343,17 +338,13 @@ def publish_single_sensor(client, device_name, sensor_type, sensor_name, sensor_
     # We'll use the device_name derived from the GPU for the topic_device_id and sensor_type directly.
     
     # Create topic with hierarchical structure
-    # Check if sensor_name is the same as sensor_type, if so, omit it from the topic path
-    if sensor_name == sensor_type:
-        topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}"
-    else:
-        topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
+    topic = f"{target_mqtt_topic_base}/{device_name}/{sensor_type}/{sensor_name}"
     
     # Prepare message payload
     payload = {
         "timestamp": timestamp,
         "sensor_type": sensor_type,
-        "sensor_name": sensor_name, # Keep sensor_name in payload for detail, even if omitted from topic path
+        "sensor_name": sensor_name,
         "value": sensor_value
     }
     
